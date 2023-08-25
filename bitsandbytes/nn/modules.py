@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 from typing import Optional, TypeVar, Union, overload
 
+import warnings
 import torch
 import torch.nn.functional as F
 from torch import Tensor, device, dtype, nn
@@ -92,6 +93,7 @@ class Embedding(torch.nn.Embedding):
         scale_grad_by_freq: bool = False,
         sparse: bool = False,
         _weight: Optional[Tensor] = None,
+        device: Optional[device] = None,
     ) -> None:
         super().__init__(
             num_embeddings,
@@ -102,6 +104,7 @@ class Embedding(torch.nn.Embedding):
             scale_grad_by_freq,
             sparse,
             _weight,
+            device=device
         )
         GlobalOptimManager.get_instance().register_module_override(
             self, "weight", {"optim_bits": 32}
@@ -188,9 +191,9 @@ class Params4bit(torch.nn.Parameter):
                     #s[-2][1][0] = s[-2][1][0].to(device) # nested absmax
 
                     # for 8-bit
-                    s[-2][0] = s[-2][0].to(device) # offset
-                    s[-2][1][0] = s[-2][1][0].to(device) # nested quantiation state statitics
-                    s[-2][1][1] = s[-2][1][1].to(device) # nested quantiation codebook
+                    s[-3][0] = s[-3][0].to(device) # offset
+                    s[-3][1][0] = s[-3][1][0].to(device) # nested quantiation state statitics
+                    s[-3][1][1] = s[-3][1][1].to(device) # nested quantiation codebook
             new_param = Params4bit(super().to(device=device, dtype=dtype, non_blocking=non_blocking),
                                   requires_grad=self.requires_grad, quant_state=self.quant_state,
                                    blocksize=self.blocksize, compress_statistics=self.compress_statistics,
@@ -199,10 +202,32 @@ class Params4bit(torch.nn.Parameter):
             return new_param
 
 class Linear4bit(nn.Linear):
-    def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True, quant_type='fp4'):
-        super().__init__(input_features, output_features, bias)
+    def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True, quant_type='fp4',device=None):
+        super().__init__(input_features, output_features, bias, device)
         self.weight = Params4bit(self.weight.data, requires_grad=False, compress_statistics=compress_statistics, quant_type=quant_type)
         self.compute_dtype = compute_dtype
+        self.compute_type_is_set = False
+
+    def set_compute_type(self, x):
+        if x.dtype in [torch.float32, torch.bfloat16]:
+            # the input is in a dtype that is safe to compute in, we switch
+            # to this type for speed and stability
+            self.compute_dtype = x.dtype
+        elif x.dtype == torch.float16:
+            # we take the compoute dtype passed into the layer
+            if self.compute_dtype == torch.float32 and (x.numel() == x.shape[-1]):
+                # single batch inference with input torch.float16 and compute_dtype float32 -> slow inference when it could be fast
+                # warn the user about this
+                warnings.warn(f'Input type into Linear4bit is torch.float16, but bnb_4bit_compute_type=torch.float32 (default). This will lead to slow inference.')
+                warnings.filterwarnings('ignore', message='.*inference.')
+            if self.compute_dtype == torch.float32 and (x.numel() != x.shape[-1]):
+                warnings.warn(f'Input type into Linear4bit is torch.float16, but bnb_4bit_compute_type=torch.float32 (default). This will lead to slow inference or training speed.')
+                warnings.filterwarnings('ignore', message='.*inference or training')
+
+
+
+
+
 
     def forward(self, x: torch.Tensor):
         # weights are cast automatically as Int8Params, but the bias has to be cast manually
@@ -211,6 +236,10 @@ class Linear4bit(nn.Linear):
 
         if getattr(self.weight, 'quant_state', None) is None:
             print('FP4 quantization state not initialized. Please call .cuda() or .to(device) on the LinearFP4 layer first.')
+        if not self.compute_type_is_set:
+            self.set_compute_type(x)
+            self.compute_type_is_set = True
+
         inp_dtype = x.dtype
         if self.compute_dtype is not None:
             x = x.to(self.compute_dtype)
@@ -223,12 +252,22 @@ class Linear4bit(nn.Linear):
         return out
 
 class LinearFP4(Linear4bit):
-    def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True):
-        super().__init__(input_features, output_features, bias, compute_dtype, compress_statistics, 'fp4')
+    def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True,device=None):
+        super().__init__(input_features, output_features, bias, compute_dtype, compress_statistics, 'fp4', device)
 
 class LinearNF4(Linear4bit):
-    def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True):
-        super().__init__(input_features, output_features, bias, compute_dtype, compress_statistics, 'nf4')
+    ''' Implements the NF4 data type.
+
+        Constructs a quantization data type where each bin has equal area under a standard normal distribution N(0, 1) that
+        is normalized into the range [-1, 1].
+
+        For more information read the paper: QLoRA: Efficient Finetuning of Quantized LLMs (https://arxiv.org/abs/2305.14314)
+
+        Implementation of the NF4 data type in bitsandbytes can be found in the `create_normal_map` function in
+        the `functional.py` file: https://github.com/TimDettmers/bitsandbytes/blob/main/bitsandbytes/functional.py#L236.
+    '''
+    def __init__(self, input_features, output_features, bias=True, compute_dtype=None, compress_statistics=True,device=None):
+        super().__init__(input_features, output_features, bias, compute_dtype, compress_statistics, 'nf4', device)
 
 
 
@@ -320,8 +359,8 @@ def maybe_rearrange_weight(state_dict, prefix, local_metadata, strict, missing_k
 
 class Linear8bitLt(nn.Linear):
     def __init__(self, input_features, output_features, bias=True, has_fp16_weights=True,
-                       memory_efficient_backward=False, threshold=0.0, index=None):
-        super().__init__(input_features, output_features, bias)
+                       memory_efficient_backward=False, threshold=0.0, index=None, device=None):
+        super().__init__(input_features, output_features, bias, device)
         assert not memory_efficient_backward, "memory_efficient_backward is no longer required and the argument is deprecated in 0.37.0 and will be removed in 0.39.0"
         self.state = bnb.MatmulLtState()
         self.index = index
@@ -411,8 +450,8 @@ class Linear8bitLt(nn.Linear):
 
 
 class OutlierAwareLinear(nn.Linear):
-    def __init__(self, input_features, output_features, bias=True):
-        super().__init__(input_features, output_features, bias)
+    def __init__(self, input_features, output_features, bias=True, device=None):
+        super().__init__(input_features, output_features, bias, device)
         self.outlier_dim = None
         self.is_quantized = False
 
@@ -446,9 +485,10 @@ class SwitchBackLinearBnb(nn.Linear):
         memory_efficient_backward=False,
         threshold=0.0,
         index=None,
+        device=None
     ):
         super().__init__(
-            input_features, output_features, bias
+            input_features, output_features, bias, device
         )
         self.state = bnb.MatmulLtState()
         self.index = index
